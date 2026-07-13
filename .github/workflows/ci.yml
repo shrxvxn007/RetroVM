@@ -1,0 +1,135 @@
+# RetroVM — CI
+#
+# Runs on every push to main and every PR targeting main. Builds with both
+# Clang and GCC, then exercises:
+#   * Phase 1: built-in demo (must print "DEMO PASSED")
+#   * Phase 3: record + clean replay round trip (must print "replay VERIFIED")
+#   * Phase 3: three divergence scenarios. Each MUST be detected — if a
+#     corrupted trace replays cleanly the CI fails (false negative).
+#     Conversely, the clean-replay step's non-zero exit on a false-positive
+#     detection also fails CI (clean replay rejected).
+#
+# Trace format reminder (little-endian):
+#   Header (16 B): magic[8] | version[4] | reserved[4]
+#   Frame  (16 B): cycle[8] | opcode[1] | pad[3] | value[4]
+#   Frame 0 starts at offset 16, so cycle=offset 16..23, opcode=offset 24.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & test (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Run both Clang and GCC to completion even if one fails — we want
+      # to see ALL compiler errors, not just the first one.
+      fail-fast: false
+      matrix:
+        compiler: [clang, gcc]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select compiler
+        # ubuntu-latest runners ship both g++/gcc and clang/clang++ pre-installed.
+        shell: bash
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+            echo "CC=clang"   >> "$GITHUB_ENV"
+          else
+            echo "CXX=g++" >> "$GITHUB_ENV"
+            echo "CC=gcc"  >> "$GITHUB_ENV"
+          fi
+          echo "Using ${{ matrix.compiler }} (CXX=$CXX CC=$CC)"
+
+      - name: Configure (CMake)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX"
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: Re-assemble programs/io.bin from programs/io.asm
+        # Always re-assemble so a stale .bin in the tree can't mask a
+        # regression in the assembler.
+        run: ./build/retrovm asm programs/io.asm programs/io.bin
+
+      # ---------- Phase 1 ----------
+      - name: Phase 1 — built-in demo
+        # Built-in demo asserts R0=5, R1=7, R2=12, mem[0x100]=12, halt=1,
+        # cycles=7, then prints "DEMO PASSED". Exit code 0 = pass.
+        run: ./build/retrovm
+
+      # ---------- Phase 3: clean round trip ----------
+      - name: Phase 3 — record + clean replay round trip
+        # Record a 3-frame trace from "11\n22\n" stdin, then replay it
+        # against the same program. A false-positive divergence detector
+        # (replay rejecting a clean trace) would make `replay` exit 3 and
+        # fail this step.
+        run: |
+          printf '11\n22\n' | ./build/retrovm record programs/io.bin
+          ./build/retrovm replay programs/io.bin programs/io.bin.trace
+
+      # ---------- Phase 3: three divergence scenarios ----------
+      # Each step copies the clean trace, mutates it, then attempts replay.
+      # A correct replay returns 3 ("Divergence Detected!"). If replay
+      # returns 0 we have a false negative and the step fails the build.
+
+      - name: Divergence — cycle corruption must be detected
+        # Bump frame 0's cycle by 1. Replay asks for cycle 3, gets a
+        # frame claiming cycle 4. TraceMismatch expected.
+        run: |
+          cp programs/io.bin.trace /tmp/io_bad_cycle.trace
+          python3 -c "
+          import struct
+          with open('/tmp/io_bad_cycle.trace', 'r+b') as f:
+              f.seek(16); b = f.read(8)
+              v = struct.unpack('<Q', b)[0] + 1
+              f.seek(16); f.write(struct.pack('<Q', v))
+          "
+          if ./build/retrovm replay programs/io.bin /tmp/io_bad_cycle.trace; then
+            echo "::error::Cycle corruption was NOT detected (false negative)"
+            exit 1
+          fi
+          echo "OK: cycle corruption correctly flagged as divergence"
+
+      - name: Divergence — opcode corruption must be detected
+        # Overwrite frame 0's opcode byte (offset 24) with 0x0B (OP_LI)
+        # to differ from the VM's expected 0x09 (OP_IN). TraceMismatch
+        # expected on the (cycle, opcode) comparison.
+        run: |
+          cp programs/io.bin.trace /tmp/io_bad_opcode.trace
+          python3 -c "
+          with open('/tmp/io_bad_opcode.trace', 'r+b') as f:
+              f.seek(24); f.write(bytes([0x0B]))
+          "
+          if ./build/retrovm replay programs/io.bin /tmp/io_bad_opcode.trace; then
+            echo "::error::Opcode corruption was NOT detected (false negative)"
+            exit 1
+          fi
+          echo "OK: opcode corruption correctly flagged as divergence"
+
+      - name: Divergence — trace truncation must be detected
+        # Truncate the trace to 32 bytes — that's the 16-byte header plus
+        # a single 16-byte frame, so the replay consumes frame 0 and then
+        # runs out of frames while the program still wants frame 1.
+        # Premature-EOF TraceMismatch expected.
+        run: |
+          cp programs/io.bin.trace /tmp/io_short.trace
+          truncate -s 32 /tmp/io_short.trace
+          if ./build/retrovm replay programs/io.bin /tmp/io_short.trace; then
+            echo "::error::Trace truncation was NOT detected (false negative)"
+            exit 1
+          fi
+          echo "OK: trace truncation correctly flagged as divergence"
