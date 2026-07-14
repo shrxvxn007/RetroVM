@@ -71,8 +71,9 @@ add_test(NAME retrovm_io_record_replay
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/record_replay.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22
+                 "5
+7
+9
 ")
 set_tests_properties(retrovm_io_record_replay PROPERTIES
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -121,8 +122,9 @@ add_test(NAME retrovm_io_save_restore
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/save_restore.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22
+                 "5
+7
+9
 "
                  --at-frame=1)
 set_tests_properties(retrovm_io_save_restore PROPERTIES
@@ -152,8 +154,9 @@ add_test(NAME retrovm_io_save_restore_at_frame_0
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/save_restore.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22
+                 "5
+7
+9
 "
                  --at-frame=0)
 set_tests_properties(retrovm_io_save_restore_at_frame_0 PROPERTIES
@@ -168,8 +171,9 @@ add_test(NAME retrovm_io_save_restore_at_frame_last
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/save_restore.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22
+                 "5
+7
+9
 "
                  --at-frame=2)
 set_tests_properties(retrovm_io_save_restore_at_frame_last PROPERTIES
@@ -202,8 +206,9 @@ add_test(NAME retrovm_io_inspect
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22
+                 "5
+7
+9
 "
                  --at-frame=1)
 set_tests_properties(retrovm_io_inspect PROPERTIES
@@ -224,8 +229,8 @@ add_test(NAME retrovm_io_inspect_at_frame_0
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22\n"
+                 "5
+7\n9\n"
                  --at-frame=0)
 set_tests_properties(retrovm_io_inspect_at_frame_0 PROPERTIES
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -243,7 +248,7 @@ add_test(NAME retrovm_io_debug
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11\n22\n")
+                 "5\n7\n9\n")
 set_tests_properties(retrovm_io_debug PROPERTIES
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
          ENVIRONMENT "LC_ALL=C")
@@ -264,8 +269,9 @@ add_test(NAME retrovm_io_debug_fresh
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/debug_fresh.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22
+                 "5
+7
+9
 ")
 set_tests_properties(retrovm_io_debug_fresh PROPERTIES
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -285,8 +291,8 @@ add_test(NAME retrovm_io_inspect_diff
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect_diff.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22\n"
+                 "5
+7\n9\n"
                  --at-frame=0
                  --at-frame=1)
 set_tests_properties(retrovm_io_inspect_diff PROPERTIES
@@ -306,8 +312,9 @@ add_test(NAME retrovm_io_inspect_trace
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect_trace.sh
                  $<TARGET_FILE:retrovm>
                  programs/io.bin
-                 "11
-22
+                 "5
+7
+9
 ")
 set_tests_properties(retrovm_io_inspect_trace PROPERTIES
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

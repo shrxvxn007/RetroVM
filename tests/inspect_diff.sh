@@ -13,15 +13,16 @@
 #
 # At frame=0 the snapshot sink fires BEFORE the first IN R0 handler
 # runs (R0=0, R1=0, both LI placeholders, pc=0x08).
-# At frame=1 the first IN R0 has already been consumed (R0=11, R1=0,
-# pc=0x0C). Hence the diff MUST show frame_index, pc, and R0. It MUST
-# NOT show halted (always HALT_CHECKPOINT=6), sp (constant 0xfffffc),
-# flags (no flags set), R1-R7 (all 0 in both).
+# At frame=1 the first IN R0 has already been consumed (R0=5, R1=0,
+# pc=0x0C) given STDIN payload "5\n7\n9\n" (3 integers). Hence the
+# diff MUST show frame_index, pc, and R0. It MUST NOT show halted
+# (always HALT_CHECKPOINT=6), sp (constant 0xfffffc), flags (no flags
+# set), R1-R7 (all 0 in both).
 #
 # Args:
 #   $1 = path to retrovm binary
 #   $2 = path to .bin program (default programs/io.bin)
-#   $3 = stdin text (default "11\n22\n")
+#   $3 = stdin text (default "5\n7\n9\n")
 #   $4 = --at-frame= for state a (default 0)
 #   $5 = --at-frame= for state b (default 1)
 #
@@ -35,8 +36,9 @@ set -e
 
 RETROVM="$1"
 BIN="${2:-programs/io.bin}"
-STDIN="${3:-11
-22}"
+STDIN="${3:-5
+7
+9}"
 RAW_A="${4:-0}"
 RAW_B="${5:-1}"
 
@@ -156,18 +158,19 @@ if [ "$BIN" = "programs/io.bin" ]; then
     fi
 fi
 
-# 8. R0 MUST appear (a=0 b=11 for io.bin frame=0 vs frame=1).
+# 8. R0 MUST appear (a=0 b=5 for io.bin frame=0 vs frame=1, given
+# STDIN payload "5\n7\n9\n" in CMakeLists.txt; first IN gets 5).
 R0_LINE=$(echo "$DIFF_OUT" | awk '/^R0         : / { print; exit }')
 if [ -z "$R0_LINE" ]; then
-    echo "FAIL: R0 row missing (expected a=0 b=11 for io.bin)" >&2
+    echo "FAIL: R0 row missing (expected a=0 b=5 for io.bin)" >&2
     exit 1
 fi
 if [ "$BIN" = "programs/io.bin" ]; then
     if [ "$A_AT" = "0" ] && [ "$B_AT" = "1" ]; then
         R0_A=$(echo "$R0_LINE" | sed 's/.*a=\([0-9]*\).*/\1/')
         R0_B=$(echo "$R0_LINE" | sed 's/.*b=\([0-9]*\).*/\1/')
-        if [ "$R0_A" != "0" ] || [ "$R0_B" != "11" ]; then
-            echo "FAIL: io.bin frame=0..1 must show R0 a=0 b=11 (got a=$R0_A b=$R0_B)" >&2
+        if [ "$R0_A" != "0" ] || [ "$R0_B" != "5" ]; then
+            echo "FAIL: io.bin frame=0..1 must show R0 a=0 b=5 (got a=$R0_A b=$R0_B)" >&2
             exit 1
         fi
     fi

@@ -28,7 +28,16 @@
 #
 # Exit 0 iff retrovm debug exits 0 AND the echo-back of every command
 # line is present AND no `[trace]` line appears AND cycle progression
-# 0 → step 5 → 5 lands at HALT_STEP=8.
+# 0 → step 5 → 5 lands at HALT_STEP=8 AND, for programs/io.bin, the
+# fresh-mode IN round-trip survived (R0=5 AND R1=7 from the three
+# integer values 5, 7, 9 fed via scanf-via-tempfile).
+#
+# The R0=5 AND R1=7 check is wrapped in a `case "$BIN"` so it only
+# fires for programs/io.bin's known IN-register allocation (programs/
+# io.asm: R0=IN, R1=IN, R2=RAND). A future test against a different
+# binary — or a future io.bin variant where R1 receives something
+# else — silently skips the check rather than asserting a wrong value.
+# Mirrors tests/inspect_trace.sh's per-program case-skip pattern.
 
 set -e
 . "$(dirname -- "${BASH_SOURCE[0]}")/_lib.sh"
@@ -61,7 +70,21 @@ EOF
 # but a tempfile survives across the catch-all ERR trap if anything
 # earlier in the script fails (process substitution lives in a fd
 # that disappears when the parent shell exits).
-printf '%s' "$STDIN" >"$STDIN_P"
+#
+# Use `printf '%b'` not `printf '%s'` so `\n` in $STDIN becomes a real
+# newline. With `%s` the file would contain the literal characters
+# `\` and `n`; `scanf("%u")` would parse the first integer and fail
+# on every subsequent read (the bare `\` is not a digit and not
+# whitespace), so only `IN R0` would ever see a value. The user's
+# intent — assert R0=5 AND R1=7 after `step 5` — requires R1 to
+# actually round-trip, which requires real newlines in the file.
+#
+# Note: `%b` interprets ALL backslash escapes in $STDIN (\n → newline,
+# \t → tab, \r → carriage return, \0 → NUL etc.). The CMakeLists.txt
+# payload for this test is therefore restricted to \n-separated digits;
+# if a future caller passes tab-separated or carriage-return-separated
+# input, that will be processed as if the escapes were real chars.
+printf '%b' "$STDIN" >"$STDIN_P"
 
 # Run the REPL in fresh mode. `--batch` makes the script the command
 # source (so ctest is deterministic); `<"$STDIN_P"` feeds the VM's
@@ -145,5 +168,40 @@ if ! grep -qF "halt reason: 8" "$OUT_P"; then
     exit 1
 fi
 
-echo "PASS: debug fresh mode — echo-backs OK; no [trace] line; cycle 0→5; final halt_reason=HALT_STEP"
+# 6. IN data-flow round-trip. Belt-and-braces: scanf("%u")-via-tempfile
+# MUST deliver stdin[0] to R0 (first IN) AND stdin[1] to R1 (second
+# IN). The R2=RAND check is intentionally absent because the engine's
+# `step 5` halts at the boundary of `RAND R2` (cycle 5 fires the
+# HALT_STEP sink BEFORE `RAND R2`'s body runs), so `R2` is 0 even on
+# a clean run — asserting it would pin a known bug, not healthy
+# behavior. A separate refactor would address the underlying engine
+# resume-path / tail-dispatch pc-and-cycle rewind concern so R2 lands
+# on a clean RAND value at cycle ≥ 5; this test deliberately avoids
+# depending on that future fix.
+#
+# Why `tail -1`? The output has TWO `regs        :` lines — initial
+# (cycle=0, all zeros) and post-step-5 (the live register file). Both
+# match the sed regex; we want the LAST (post-step-5) for the load-
+# bearing assertion. Selecting the LAST occurrence matches the no-
+# rewind semantic: `regs` is a snapshot of the running state at the
+# time of the call, and the post-step-5 call's snapshot is what we
+# care about.
+#
+# Why `sed -nE` and not `get_field`? `_lib.sh::get_field` uses first-
+# occurrence semantics; for a label whose value evolves across the
+# run (initial R0=0 vs post-step-5 R0=5) we want the LAST. `sed` plus
+# `tail -1` is grep-friendly and avoids routing a new helper.
+case "$BIN" in
+    programs/io.bin)
+        r0=$(sed -nE 's/.*R0=([0-9]+)( |$).*/\1/p' "$OUT_P" | tail -1)
+        r1=$(sed -nE 's/.*R1=([0-9]+)( |$).*/\1/p' "$OUT_P" | tail -1)
+        if [ "$r0" != "5" ] || [ "$r1" != "7" ]; then
+            echo "FAIL: fresh-mode IN round-trip lost (R0=$r0 R1=$r1; want R0=5 R1=7 from STDIN='5\n7\n9' via scanf-via-tempfile)" >&2
+            cat "$OUT_P" >&2
+            exit 1
+        fi
+        ;;
+esac
+
+echo "PASS: debug fresh mode — echo-backs OK; no [trace] line; cycle 0→5; final halt_reason=HALT_STEP; IN round-trip R0=5 R1=7"
 exit 0

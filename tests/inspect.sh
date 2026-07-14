@@ -178,10 +178,11 @@ elif [ "$AT_FRAME" -ge 1 ]; then
     R1=$(get_reg 1 "$REGS_LINE")
     case "$BIN" in
         programs/io.bin)
-            # R0=11 (first IN consumed); R1=0 (placeholder; second IN's
-            # IN-handler hasn't run yet).
-            if [ "$R0" != "11" ] || [ "$R1" != "0" ]; then
-                echo "FAIL: io.bin --at-frame>=1 must show R0=11 R1=0 (got R0=$R0 R1=$R1)" >&2
+            # R0=5 (first IN consumed); R1=0 (placeholder; second IN's
+            # IN-handler hasn't run yet). STDIN payload is "5\n7\n9\n"
+            # for programs/io.bin (see CMakeLists.txt propagation).
+            if [ "$R0" != "5" ] || [ "$R1" != "0" ]; then
+                echo "FAIL: io.bin --at-frame>=1 must show R0=5 R1=0 (got R0=$R0 R1=$R1)" >&2
                 exit 1
             fi
             ;;
