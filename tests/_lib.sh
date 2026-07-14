@@ -17,13 +17,27 @@
 #
 # Helpers:
 #
-#   get_field "LABEL" "$CONTENT"
-#     Returns the trimmed text following `LABEL:` on the first line of
-#     $CONTENT whose first characters match LABEL literally. Uses
+#   get_field "LABEL" "$ARG"
+#     Returns the trimmed text following `LABEL:` on the first line
+#     of input whose first characters match LABEL literally. Uses
 #     awk's `index()` (raw substring match — no regex specials are
 #     interpreted in LABEL), so labels like `flags (ZCS):` and
 #     `pc / sp     :` match without escaping. Returns nothing if no
-#     line in $CONTENT begins with LABEL.
+#     matching line is found.
+#
+#     Dual-mode $ARG — the helper accepts either:
+#       (a) a path to an existing readable file, e.g. `get_field "x :"
+#           "$OUT_P"` — awk reads the file line-by-line.
+#       (b) a string of file CONTENTS captured via `$()`, e.g.
+#           `get_field "x :" "$INSPECT_OUT"` where `INSPECT_OUT=$("$RETROVM"
+#           inspect … 2>&1)` — awk receives the content via `<<<`.
+#     This means tests can use whichever convention fits the script:
+#     short inputs go through (a) directly to the disk, longer /
+#     already-captured content goes through (b) without a re-read.
+#     The collision risk (a content string that happens to be a path
+#     to an existing file) is acceptable in practice because ctest
+#     input strings either lack a `/` or are unique /tmp paths that
+#     don't contain label-bearing text.
 #
 #   pc_or_sp pc|sp "$PCSP_LINE"
 #     Splits the value of a parsed `pc / sp     : 0xPC / 0xSP` line on
@@ -38,16 +52,38 @@
 # them later; `set -e` keeps the floor soft without inviting silent
 # typos. The scripts that source this lib use `set -e` consistently.
 
+# When $2 is a path to an existing file, awk can read it directly and
+# avoids the here-string detour (which on macOS bash 3.2 can mangle
+# very large payloads and is also unnecessary when the file is already
+# on disk). Auto-detect file vs content: if the second argument names
+# a readable file, hand the path to awk; otherwise pipe it through
+# `<<<` so callers passing command-substituted stdout (the inspect.sh
+# style) keep working unchanged. Collision risk — a content string
+# that happens to be a path to an existing file — is acceptable in
+# practice because ctest input strings either lack a `/` or are
+# unique /tmp paths that don't contain label-bearing text.
 get_field() {
-    awk -v L="$1" '
-        index($0, L) == 1 {
-            rest = substr($0, length(L) + 1)
-            sub(/^[[:space:]]+/, "", rest)
-            sub(/[[:space:]]+$/, "", rest)
-            print rest
-            exit
-        }
-    ' <<< "$2"
+    if [ -r "$2" ]; then
+        awk -v L="$1" '
+            index($0, L) == 1 {
+                rest = substr($0, length(L) + 1)
+                sub(/^[[:space:]]+/, "", rest)
+                sub(/[[:space:]]+$/, "", rest)
+                print rest
+                exit
+            }
+        ' "$2"
+    else
+        awk -v L="$1" '
+            index($0, L) == 1 {
+                rest = substr($0, length(L) + 1)
+                sub(/^[[:space:]]+/, "", rest)
+                sub(/[[:space:]]+$/, "", rest)
+                print rest
+                exit
+            }
+        ' <<< "$2"
+    fi
 }
 
 pc_or_sp() {

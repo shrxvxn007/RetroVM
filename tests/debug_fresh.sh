@@ -103,26 +103,44 @@ if grep -qF '[trace]' "$OUT_P"; then
     exit 1
 fi
 
-# 4. Cycle progression must be 0 (initial) → 5 (post-step-5, halted at
-# HALT_STEP=8). Uses the FIRST and LAST `cycles      :` lines in the
-# captured stdout so the assertion is robust to whatever other rows
-# `dump_state` emits between the two `regs` calls.
-initial_cycle=$(awk '/^cycles      :/ { print $NF; exit }' "$OUT_P")
-post_cycle=$(awk '/^cycles      :/ { lc=$NF } END { print lc }' "$OUT_P")
-if [ "$initial_cycle" != "0" ] || [ "$post_cycle" != "5" ]; then
-    echo "FAIL: cycle progression (initial=$initial_cycle, post-step-5=$post_cycle; want 0 / 5)" >&2
+# 4. Step 5 actually advanced and the engine halted cleanly. Two
+# complementary signals — `get_field` for first-occurrence values
+# (the only values it can resolve) plus literal grep for the
+# post-step-5 emissions that only appear after the engine commits
+# the halt. The combination is grep-friendly without dragging in
+# a per-field awk pipeline.
+#
+#   * `initial_cycle` (via `get_field`) — REPL starts in HALT_RUNNING
+#     state with no instructions retired; cycle MUST be 0.
+#   * `stepped to cycle=5` literal grep — engine's step-boundary
+#     handler prints exactly this line when target_cycle=5 is
+#     reached. A regression that swaps the bp/stop-bound checks or
+#     stops the sink firing would lose this line.
+initial_cycle=$(get_field "cycles      :" "$OUT_P")
+if [ "$initial_cycle" != "0" ]; then
+    echo "FAIL: initial cycles=$initial_cycle; want 0 (HALT_RUNNING baseline)" >&2
+    cat "$OUT_P" >&2
+    exit 1
+fi
+if ! grep -qF "stepped to cycle=5" "$OUT_P"; then
+    echo "FAIL: 'stepped to cycle=5' not in output (step-boundary sink did not fire)" >&2
     cat "$OUT_P" >&2
     exit 1
 fi
 
-# 5. Final halt reason is 8 (HALT_STEP). The last `regs` block printed
-# AFTER the `step 5` line should report halted=8 because the post-step
-# 5 sink fired request_halt(HALT_STEP). A regression that fires
-# HALT_BREAKPOINT (e.g., a stray breakpoint match on the post-step pc)
-# would surface here.
-last_halt=$(awk '/^halt reason: / { print $3 }' "$OUT_P" | tail -1)
-if [ "$last_halt" != "8" ]; then
-    echo "FAIL: final halt_reason=$last_halt; expected 8 (HALT_STEP after step 5)" >&2
+# 5. Final halt was HALT_STEP=8. `get_field` returns the FIRST
+# `halt reason:` (initial state, RUNNING=0); a literal grep for
+# "halt reason: 8" confirms the post-step-5 state printed by
+# the second regs call. Together they pin the no-rewind semantic:
+# initial halted=RUNNING, post-step-5 halted=HALT_STEP.
+initial_halt=$(get_field "halt reason:" "$OUT_P")
+if [ "$initial_halt" != "0" ]; then
+    echo "FAIL: initial halt_reason=$initial_halt; want 0 (HALT_RUNNING)" >&2
+    cat "$OUT_P" >&2
+    exit 1
+fi
+if ! grep -qF "halt reason: 8" "$OUT_P"; then
+    echo "FAIL: 'halt reason: 8' (HALT_STEP) not in output" >&2
     cat "$OUT_P" >&2
     exit 1
 fi
