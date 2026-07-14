@@ -316,6 +316,48 @@ add_test(NAME retrovm_io_inspect_trace
 7
 9
 ")
+# TIMEOUT 30 is a defensive guard against a hung trace reader; ctest's
+# default of ~1500 s would mask a frozen trace_assert / infinite
+# frame_count loop as a stuck build rather than a tight round-trip
+# failure. Both Phase 6 trace ctests carry the same TIMEOUT so a fuzzer
+# hitting a future parsing regression fails fast on either entry.
 set_tests_properties(retrovm_io_inspect_trace PROPERTIES
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-         ENVIRONMENT "LC_ALL=C")
+         ENVIRONMENT "LC_ALL=C"
+         TIMEOUT 30)
+
+# Phase 6 partial-trace inspection: --frame=N selector.  Programs/io.bin
+# under stdin "5\n7\n9\n" yields a 3-frame trace (2 IN + 1 RAND); the test
+# asserts each frame's cycle/opcode/value plus the out-of-range and
+# parse-error failure modes are wired correctly.  Mirrors the inspect_trace
+# ctest in WORKING_DIRECTORY / ENVIRONMENT / TIMEOUT so the two run
+# under identical sh-imposed constraints.
+add_test(NAME retrovm_io_inspect_frame
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect_frame.sh
+                 $<TARGET_FILE:retrovm>
+                 programs/io.bin
+                 "5
+7
+9
+")
+# Same TIMEOUT 30 defend-in-depth guard as retrovm_io_inspect_trace above;
+# see that comment for rationale on why the under-30-s fast-path is
+# preferable to ctest's 1500-s default for both Phase 6 trace ctests.
+set_tests_properties(retrovm_io_inspect_frame PROPERTIES
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+         ENVIRONMENT "LC_ALL=C"
+         TIMEOUT 30)
+
+# --frame=N coverage gap closer: real run traces only ever carry
+# OP_IN (0x09) / OP_RAND (0x0A) frames so the per-frame branch's
+# third (unknown-opcode) case is unreachable in normal recordings.
+# This test hand-mints a 32 B synthetic .trace with opcode=0x42 and
+# asserts the printer formats it as `0x42 (unknown)`. Without it a
+# regression in the printer would not surface as a ctest failure.
+add_test(NAME retrovm_io_inspect_unknown_opcode
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect_unknown_opcode.sh
+                 $<TARGET_FILE:retrovm>)
+set_tests_properties(retrovm_io_inspect_unknown_opcode PROPERTIES
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+         ENVIRONMENT "LC_ALL=C"
+         TIMEOUT 30)

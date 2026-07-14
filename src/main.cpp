@@ -1708,7 +1708,9 @@ int cmd_inspect_diff(const std::string& a_path, const std::string& b_path) {
 // diagnostic and a non-zero exit so a ctest failure surfaces the
 // underlying parse error verbatim instead of an uncaught exception.
 
-int cmd_inspect_trace(const std::string& trace_path) {
+int cmd_inspect_trace(const std::string& trace_path,
+                      bool has_frame,
+                      std::size_t frame_idx) {
     std::unique_ptr<TraceReader> reader;
     try {
         reader = std::make_unique<TraceReader>(trace_path);
@@ -1722,6 +1724,46 @@ int cmd_inspect_trace(const std::string& trace_path) {
             "retrovm trace: '%s' opened but reader reports invalid\n",
             trace_path.c_str());
         return 1;
+    }
+
+    // --frame=N: replace the whole-trace aggregate with a single-frame
+    // block. The banner is shared with the aggregate form so callers
+    // piping both invocations through `grep "===" \\| grep "frame"` see a
+    // consistent banner; the unique `frame_index :` row makes this
+    // output distinguishable from the aggregate WITHOUT any other
+    // change (aggregate has no `frame_index`, `cycle`, `opcode`, or
+    // `value` row).  Existing tests (inspect_trace.sh) pass through the
+    // `has_frame == false` branch unchanged.
+    if (has_frame) {
+        const TraceFrame* f = reader->frame_at(frame_idx);
+        if (!f) {
+            std::fprintf(stderr,
+                "retrovm trace: --frame=%zu out of range "
+                "(trace has %zu frames in '%s')\n",
+                frame_idx, reader->frame_count(), trace_path.c_str());
+            return 1;
+        }
+        std::printf("=== RetroVM trace inspect ===\n");
+        std::printf("file        : %s\n", trace_path.c_str());
+        std::printf("frame_index : %zu\n", frame_idx);
+        std::printf("cycle       : %llu\n",
+                    static_cast<unsigned long long>(f->cycle));
+        // Opcode is a uint8 (0x09 = OP_IN, 0x0A = OP_RAND per trace.hpp
+        // and opcodes.hpp). Print as hex + mnemonic so a tester can
+        // grep "OP_IN" / "OP_RAND" without learning the hex codes;
+        // anything else prints as "unknown" so a wire-format anomaly
+        // is at least labeled even if the cause is not recognised.
+        // (Lower-case "unknown" deliberately avoids colliding with the
+        // aggregate form's `op_other : N` count-row label, which counts
+        // the same out-of-set frames but from a different column.)
+        const char* op_name =
+            (f->opcode == OP_IN)   ? "OP_IN"   :
+            (f->opcode == OP_RAND) ? "OP_RAND" : "unknown";
+        std::printf("opcode      : 0x%02X (%s)\n",
+                    static_cast<unsigned>(f->opcode), op_name);
+        std::printf("value       : %u\n",
+                    static_cast<unsigned>(f->value));
+        return 0;
     }
 
     std::printf("=== RetroVM trace inspect ===\n");
@@ -1975,7 +2017,7 @@ int main(int argc, char** argv) {
         return cmd_debug(argv[2], trace_arg, batch_arg);
     }
     if (mode == "trace") {
-        // retrovm trace <bin.trace>
+        // retrovm trace <bin.trace> [--frame=N]
         //
         // Phase 6 offline reader for a saved .trace file. Loads NO VM,
         // starts NO replay session, and does NOT require the
@@ -1984,11 +2026,45 @@ int main(int argc, char** argv) {
         // `get_field` helper in tests/_lib.sh works unchanged. Tests/
         // inspect_trace.sh asserts the banner, magic, version, frame
         // count, and opcode breakdown against a real recorded trace.
+        // Tests/inspect_frame.sh adds partial-trace inspection via
+        // --frame=N (replaces the aggregate with a single-frame block).
         if (argc < 3) {
             std::fprintf(stderr, "retrovm trace: missing <trace>\n");
             return 1;
         }
-        return cmd_inspect_trace(argv[2]);
+        bool has_frame = false;
+        std::size_t frame_idx = 0;
+        for (int i = 3; i < argc; ++i) {
+            const std::string arg = argv[i];
+            constexpr const char* kPrefix = "--frame=";
+            if (arg.rfind(kPrefix, 0) != 0) {
+                std::fprintf(stderr,
+                    "retrovm trace: unknown arg '%s' (only --frame=N is accepted)\n",
+                    argv[i]);
+                return 1;
+            }
+            const char* digits = arg.c_str() + 8;  // skip "--frame="
+            if (*digits == '\0') {
+                std::fprintf(stderr, "retrovm trace: --frame= requires a value\n");
+                return 1;
+            }
+            // strtoull is intentionally too permissive here: an
+            // out-of-range N rejects cleanly inside cmd_inspect_trace
+            // once the reader is open (the gate is frame_count()).
+            // Tightening to a 0..numeric cap would just push the error
+            // path away from the natural "trace has N frames" message.
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(digits, &end, 10);
+            if (end == digits || *end != '\0') {
+                std::fprintf(stderr,
+                    "retrovm trace: invalid --frame '%s' (expected 0..)\n",
+                    argv[i]);
+                return 1;
+            }
+            has_frame = true;
+            frame_idx = static_cast<std::size_t>(parsed);
+        }
+        return cmd_inspect_trace(argv[2], has_frame, frame_idx);
     }
     if (mode == "inspect") {
         // retrovm inspect <state-file>
@@ -2035,7 +2111,7 @@ int main(int argc, char** argv) {
         "  retrovm restore  <bin> <trace> <state>  resume replay from a saved .state\n"
         "  retrovm inspect  <state>               print a saved .state (offline, no VM / trace)\n"
         "  retrovm inspect  --diff <a> <b>        side-by-side per-field delta, equal columns suppressed\n"
-        "  retrovm trace    <trace>               print a saved .trace (offline, no VM / bin)\n"
+        "  retrovm trace    <trace> [--frame=N]   print a saved .trace (offline, no VM / bin)\n"
         "  retrovm debug    <bin> [--trace <t>] [--batch <script>]\n"
         "                                       interactive REPL: step/continue/regs/where/breakpoint/save\n"
         "  retrovm --benchmark [N]                 measure dispatch throughput (default N=1000)\n");

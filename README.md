@@ -63,12 +63,21 @@ time-travel debugger, written from scratch in modern C++20.
 
 ### `trace` subcommand (Phase 6 offline reader)
 
-`retrovm trace <bin.trace>` reads a `.trace` file from disk and prints
-its header + aggregate frame stats using the same one-line-per-field
-label layout that `dump_state()` / `cmd_inspect` / `cmd_inspect_diff`
-share. **No VM is loaded, no replay session is started, and the
-corresponding `<bin>` is NOT required** — the trace is self-describing
-per the wire format above.
+`retrovm trace <bin.trace> [--frame=N]` reads a `.trace` file from disk
+and prints its header + aggregate frame stats using the same
+one-line-per-field label layout that `dump_state()` / `cmd_inspect` /
+`cmd_inspect_diff` share. **No VM is loaded, no replay session is
+started, and the corresponding `<bin>` is NOT required** — the trace is
+self-describing per the wire format above.
+
+The `--frame=N` flag pivots the reader from whole-trace aggregate
+output to per-frame inspection: the same file is opened, the same wire
+format is decoded, but the body is one labeled `frame_index / cycle /
+opcode / value` block instead of `frame_count / cycle_first..last /
+op_IN..op_RAND`. --frame is zero-based; out-of-range N exits non-zero
+with `out of range (trace has M frames in '<path>')` so a ctest that
+later renumbers frames fails loudly instead of silently printing the
+wrong frame.
 
 Output columns (label-anchored, grep-friendly via the `get_field`
 helper in `tests/_lib.sh`):
@@ -101,6 +110,39 @@ op_RAND     : 1
 - `TraceReader`'s ctor already throws on bad magic / wrong version
   / truncated file; the CLI catches that as a stderr diagnostic
   and returns exit 1.
+
+Passing `--frame=N` pivots the reader from aggregate to per-frame:
+
+```
+$ ./build/retrovm trace programs/io.bin.trace --frame=2
+=== RetroVM trace inspect ===
+file        : programs/io.bin.trace
+frame_index : 2
+cycle       : 5
+opcode      : 0x0A (OP_RAND)
+value       : <varies by seed>
+```
+
+The banner is shared with the aggregate form so a script that greps
+both invocations by `=== RetroVM trace inspect ===` still routes them
+through one filter; the unique `frame_index :` row makes a per-frame
+vs aggregate disambiguation trivial without learning a second banner.
+Label widths match the aggregate (label padded to 11 chars + `:` so
+all rows hit the same column) so a future `--frame` family that adds
+fields (e.g. `cycle_at_N_minus_1`) drops cleanly into the same column
+schema used by `tests/_lib.sh: get_field`.
+
+Use cases unlocked:
+
+- **Compare one frame's value to an expected value** — e.g. "the seeded
+  RAND frame at cycle 5 should be X; what is it?" — without spinning up
+  the VM, replaying, or parsing 64 B `.state` files.
+- **Regression check on a wave's first/last frame** — `--frame=0` and
+  `--frame=N-1` together pin the cycle-min and cycle-max values that
+  the engine's IN/RAND dispatch loop is supposed to fire at, independent
+  of the surrounding program shape.
+- **Walking an unrelated trace file's first few frames** to sanity-check
+  the wire format before subscribing to its per-opcode counts.
 
 ### Trace format (`.trace`)
 
