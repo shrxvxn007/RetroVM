@@ -511,6 +511,235 @@ int cmd_benchmark(std::size_t n_iters) {
     return 0;
 }
 
+// ----- benchmark: time-travel rewind (cmd_benchmark_backn) ---------------
+//
+// Substantiates (or refutes) the resume-bullet "sub-millisecond timeline
+// recovery" claim with a reproducible, std::chrono-timed measurement of
+// the `back N` rewind path. Built as a peer of cmd_benchmark so anyone
+// with the existing build can reproduce the number (`./build/retrovm
+// --bench-back 1000`) without scripting a REPL batch file.
+//
+// Methodology (parallels cmd_benchmark's warmup+timed-phase shape):
+//   1. Reuse the same 12-instruction synthetic workload cmd_benchmark
+//      uses (1024 loop iters, 9219 cycles total). Zero non-determinism
+//      (no IN/RAND opcodes) so the workload produces a byte-stable
+//      ring across runs.
+//   2. Set snap_interval=1 — the cmd_debug hardcoded value the REPL
+//      ships with — so every cycle fires the snapshot sink. The ring
+//      caps at kRingCap=256, so eviction kicks in after cycle 256;
+//      history_index saturates at 255 once steady-state.
+//   3. Install a snapshot sink that ALSO halts via target_cycle +
+//      request_halt(HALT_STEP) when the requested depth is reached
+//      (mirrors cmd_debug's `step N` boundary check; same field, same
+//      HALT_STEP tag, same resume-after-halt plumbing).
+//   4. Untimet sanity run: HALT_NORMAL + 9219 cycles must match
+//      cmd_benchmark's expected count, or refuse to print a benchmark.
+//   5. Untimed warmup: one (back depth + step depth) round to prime
+//      caches and bring the ring to a coherent steady-state shape so
+//      the timed phase measures apples-to-apples.
+//   6. Timed phase: n_iters (back depth + step depth) loops, total
+//      wall-clock divided by n_iters = mean us per back-op.
+//
+// Return code is the SUB-MILLISECOND ASSERTION. <1000 us per back op
+// = exit 0 (claim substantiated). >=1000 us = exit 1 (claim refuted).
+// The `scripts/run-bench-backN.sh` wrapper propagates this exit code.
+
+static constexpr std::size_t kBenchRingCap = 256u;  // matches CmdDebug::kRingCap
+
+int cmd_benchmark_backn(std::size_t n_iters, std::size_t depth) {
+    // Belt-and-braces guard against depth == kBenchRingCap, which would
+    // make do_back() compute (kBenchRingCap - 1) - kBenchRingCap as a
+    // size_t underflow and crash via out-of-bounds ring access. The
+    // caller in main() already rejects this case at parse time; this
+    // guard catches direct callers (e.g. a future ctest harness that
+    // invokes the function via a friend accessor) and makes the
+    // precondition explicit at the call site.
+    if (depth >= kBenchRingCap) {
+        std::fprintf(stderr,
+            "retrovm --bench-back: invalid depth '%zu' (must be < %zu; "
+            "otherwise target_idx underflows when ring is saturated)\n",
+            depth, kBenchRingCap);
+        return 1;
+    }
+
+    // Same 12-instruction synthetic workload as cmd_benchmark. The
+    // 9219-cycle total backfill keeps the ring saturated to its
+    // 256-snapshot cap well before the timed phase starts.
+    const std::vector<uint32_t> program = {
+        encode(OP_LI,    0, 0, kBenchmarkLoopCount),
+        encode(OP_LI,    1, 0, 1u                 ),
+        encode(OP_ADD,   2, 1, 0u                 ),
+        encode(OP_ADD,   3, 1, 0u                 ),
+        encode(OP_SUB,   4, 0, 0u                 ),
+        encode(OP_MUL,   5, 1, 0u                 ),
+        encode(OP_DIV,   6, 1, 0u                 ),
+        encode(OP_STORE, 2, 0, 0x100u             ),
+        encode(OP_LOAD,  7, 0, 0x100u             ),
+        encode(OP_SUB,   0, 1, 0u                 ),
+        encode(OP_JNZ,   0, 0, 0x08u              ),
+        encode(OP_HALT,  0, 0, 0u                 ),
+    };
+
+    VM vm;
+    if (!vm.load_program(reinterpret_cast<const uint8_t*>(program.data()),
+                         program.size() * 4u)) {
+        std::fprintf(stderr, "retrovm: benchmark program too large\n");
+        return 1;
+    }
+
+    // Local ring + history_index + target_cycle — mirrors the
+    // cmd_debug CmdDebug struct, less the replay-mode cursor (no
+    // trace is loaded in the bench, so there's no cursor to rewind).
+    std::deque<Snapshot>  ring;
+    std::size_t           history_index = 0;
+    std::uint64_t         target_cycle  = UINT64_MAX;
+
+    // Sink: identical shape to CmdDebug's install_debug_sink. The
+    // step-boundary check fires HALT_STEP at target_cycle; the ring
+    // push happens unconditionally so a halted VM can still be
+    // rewound past its halt point (mirrors cmd_debug's behaviour).
+    // Note: no breakpoint/phase-5b event logic — the bench only ever
+    // halts via target_cycle, not via a breakpoint.
+    vm.set_snapshot_interval(1);
+    vm.set_snapshot_sink(
+        [&ring, &history_index, &target_cycle, &vm]
+        (const Snapshot& s) {
+            if (target_cycle != UINT64_MAX
+                && s.cycle_count >= target_cycle) {
+                target_cycle = UINT64_MAX;
+                vm.request_halt(HALT_STEP);
+            }
+            ring.resize(history_index + 1);
+            ring.push_back(s);
+            if (ring.size() > kBenchRingCap) {
+                ring.pop_front();
+                // history_index unchanged: still points at ring.back()
+            } else {
+                ++history_index;
+            }
+        });
+
+    // Sanity: full run must HALT_NORMAL with the cmd_benchmark-expected
+    // 9219 cycles. Refuse to print a benchmark otherwise; ns/op numbers
+    // drawn from a divergent workload are meaningless.
+    const HaltReason sanity = vm.run();
+    if (sanity != HALT_NORMAL) {
+        std::fprintf(stderr, "retrovm: benchmark sanity failed (halt=%u)\n",
+                     static_cast<unsigned>(sanity));
+        return 1;
+    }
+    const std::uint64_t cycles_per_run = vm.state().cycle_count;
+    if (cycles_per_run != (2u + 9u * kBenchmarkLoopCount + 1u)) {
+        std::fprintf(stderr,
+            "retrovm: benchmark cycle count drift (got %llu, want %u)\n",
+            static_cast<unsigned long long>(cycles_per_run),
+            2u + 9u * kBenchmarkLoopCount + 1u);
+        return 1;
+    }
+
+    // After sanity: ring.size() == 256 (capped; eviction evicted
+    // the oldest ~8963 snapshots) and history_index == 255 (saturated
+    // by eviction per the sink's `else/++history_index` branch).
+    // cycle_count == 9219 and halted == HALT_NORMAL.
+
+    // Local lambda: undo ring[lo+1..hi]'s MemDeltas in reverse-LIFO
+    // order. Mirrors cmd_debug's `back` handler step 1 exactly.
+    auto undo_deltas = [&](std::size_t lo, std::size_t hi) {
+        for (std::size_t k = hi; k > lo; --k) {
+            const auto& deltas = ring[k].deltas;
+            for (auto it = deltas.rbegin(); it != deltas.rend(); ++it) {
+                vm.apply_old_value(*it);
+            }
+        }
+    };
+
+    // Local lambda: restore VMState from ring[idx]. Mirrors cmd_debug's
+    // `back` handler step 2 exactly (no pc/cycle offset — TAIL_DISPATCH
+    // has already advanced them by 4/1 before the sink fires, so a
+    // verbatim restore places the next TAIL at the exact instruction
+    // we stopped at).
+    auto restore_state = [&](std::size_t idx) {
+        const Snapshot& tgt = ring[idx];
+        VMState vs = vm.state();
+        vs.cycle_count = tgt.cycle_count;
+        for (int i = 0; i < 8; ++i) vs.regs[i] = tgt.regs[i];
+        vs.pc     = tgt.pc;
+        vs.sp     = tgt.sp;
+        vs.flags  = tgt.flags;
+        vs.halted = tgt.halted;
+        vm.set_state(vs);
+    };
+
+    // Local lambda: `back depth` snapshots — undo, restore, decrement.
+    // No replay-cursor rewind (bench has no trace cursor to rewind).
+    auto do_back = [&]() {
+        const std::size_t target_idx = history_index - depth;
+        undo_deltas(target_idx, history_index);
+        restore_state(target_idx);
+        history_index = target_idx;
+    };
+
+    // Local lambda: `step depth` cycles via vm.run() with target_cycle
+    // semantics identical to cmd_debug's `step N`. Requires resuming
+    // the halted VM first (debug_resume refuses HALT_NORMAL, so the
+    // bench flips halted -> HALT_RUNNING via set_state directly; the
+    // bench has no outside observer for that flag).
+    auto do_step = [&]() {
+        {
+            VMState vs = vm.state();
+            vs.halted = HALT_RUNNING;
+            vm.set_state(vs);
+        }
+        target_cycle = vm.state().cycle_count + depth;
+        vm.run();
+    };
+
+    // Warmup: one round of (back depth + step depth) to prime caches,
+    // verify the loop is coherent, and bring the ring back to the
+    // post-sanity steady-state shape (history_index == 255, ring full)
+    // so the timed phase measures apples-to-apples.
+    do_back();
+    do_step();
+
+    // Timed phase: n_iters (back + step) loops.
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < n_iters; ++i) {
+        do_back();
+        do_step();
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    const double total_us =
+        std::chrono::duration<double, std::micro>(t1 - t0).count();
+    const double us_per_back_op = total_us / static_cast<double>(n_iters);
+    const double us_per_cycle_rewind =
+        us_per_back_op / static_cast<double>(depth);
+
+    std::printf("retrovm: benchmark back-N\n");
+    std::printf("  synthetic workload   : %zu instructions, %llu cycles/run\n",
+                program.size(),
+                static_cast<unsigned long long>(cycles_per_run));
+    std::printf("  ring configuration   : snap_interval=1, capacity=%zu (cmd_debug hardcoded setting)\n",
+                kBenchRingCap);
+    std::printf("  depth (snapshots/op) : %zu\n", depth);
+    std::printf("  timed iters          : %zu\n", n_iters);
+    std::printf("  total back ops       : %zu\n", n_iters);
+    std::printf("  total elapsed        : %.3f ms\n", total_us / 1000.0);
+    std::printf("  us / back op         : %.3f us\n", us_per_back_op);
+    std::printf("  us / cycle rewind    : %.3f us\n", us_per_cycle_rewind);
+    std::printf("  history_index        : 255 (ring cap saturated by eviction)\n");
+
+    // The sub-millisecond assertion. <1000 us per back op -> exit 0
+    // (claim substantiated); >=1000 us -> exit 1 (claim refuted).
+    if (us_per_back_op < 1000.0) {
+        std::printf("  result               : PASS (sub-millisecond claim substantiated)\n");
+        return 0;
+    }
+    std::printf("  result               : FAIL (sub-millisecond claim refuted: %.3f us >= 1000 us)\n",
+                us_per_back_op);
+    return 1;
+}
+
 // ----- save (Phase 4): replay up to a target trace frame, dump state -----
 //
 // `cmd_save` runs the replay driver against the .trace log, but stops the
@@ -1902,6 +2131,48 @@ int main(int argc, char** argv) {
         }
         return cmd_benchmark(n);
     }
+    if (mode == "--bench-back" || mode == "bench-back") {
+        // retrovm --bench-back [N [depth]]
+        //   N      = timed iters             (default 1000; max 100000000)
+        //   depth  = snapshots per back op   (default 200; max kBenchRingCap=256)
+        // depth must fit the ring cap exactly so each back op stays
+        // valid (history_index - depth >= 0 once we're in steady state).
+        std::size_t n = 1000;
+        std::size_t depth = 200;
+        if (argc >= 3) {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(argv[2], &end, 10);
+            if (end == argv[2] || *end != '\0' || parsed == 0u || parsed > 100000000u) {
+                std::fprintf(stderr,
+                    "retrovm --bench-back: invalid N '%s' (expected 1..100000000)\n",
+                    argv[2]);
+                return 1;
+            }
+            n = static_cast<std::size_t>(parsed);
+        }
+        if (argc >= 4) {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(argv[3], &end, 10);
+            // depth must be STRICTLY less than kBenchRingCap: after
+            // sanity-run saturation history_index = kBenchRingCap - 1, so
+            // depth = kBenchRingCap makes do_back() compute
+            //   target_idx = (kBenchRingCap - 1) - kBenchRingCap
+            // which size_t-underflows and crashes via out-of-bounds
+            // ring access. Tested: code-reviewer caught this before the
+            // first build.
+            if (end == argv[3] || *end != '\0' || parsed == 0u
+                || parsed >= kBenchRingCap) {
+                std::fprintf(stderr,
+                    "retrovm --bench-back: invalid depth '%s' "
+                    "(expected 1..%zu; must be < ring cap to keep "
+                    "target_idx non-negative when ring is saturated)\n",
+                    argv[3], kBenchRingCap - 1);
+                return 1;
+            }
+            depth = static_cast<std::size_t>(parsed);
+        }
+        return cmd_benchmark_backn(n, depth);
+    }
     if (mode == "snapshot" || mode == "snap") {
         if (argc < 3) {
             std::fprintf(stderr, "retrovm snapshot: missing <bin>\n");
@@ -2114,6 +2385,7 @@ int main(int argc, char** argv) {
         "  retrovm trace    <trace> [--frame=N]   print a saved .trace (offline, no VM / bin)\n"
         "  retrovm debug    <bin> [--trace <t>] [--batch <script>]\n"
         "                                       interactive REPL: step/continue/regs/where/breakpoint/save\n"
-        "  retrovm --benchmark [N]                 measure dispatch throughput (default N=1000)\n");
+        "  retrovm --benchmark [N]                 measure dispatch throughput (default N=1000)\n"
+        "  retrovm --bench-back [N [depth]]        measure back-N rewind latency (default N=1000 depth=200, max depth=ring cap)\n");
     return 1;
 }

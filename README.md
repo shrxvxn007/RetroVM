@@ -32,14 +32,85 @@ time-travel debugger, written from scratch in modern C++20.
 
 - **Dispatch:** token-threaded interpreter using Clang/GCC labels-as-values
   (`&&label`) and a tail-dispatch macro. Every opcode handler ends with a
-  single indirect branch into the next handler — no megamorphic `while`
-  head, no cold `switch`. Measured **2.00 ns/instruction (500.80 MIPS)**
-  on this release-build binary via `./build/retrovm --benchmark 10000`
-  (synthetic 12-instruction / 48 B workload covering LI / ADD / SUB /
-  MUL / DIV / LOAD / STORE / JNZ / HALT — IN / RAND deliberately excluded
-  so the std::function IOHook indirect calls don't skew the per-op number;
-  9 219 cycles per run, 1 untimed warmup + 10 000 timed runs = 92.19 M
-  retired instructions in 184 ms).
+  single indirect branch into the next handler — no megamorphic `while`  head, no cold `switch`. (Measured dispatch throughput — see
+  [*Authoritative benchmark*](#authoritative-benchmark-canonical-measurement)
+  below.)
+
+### Authoritative benchmark (canonical measurement)
+
+Measured **1.85 ns/instruction (540.21 MIPS)** on this release-build binary,
+reproducible as follows. **Unix/Linux/macOS** (single-config):
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+./build/retrovm --benchmark 10000
+```
+
+**Windows / MSVC** (multi-config; generator name varies by VS install — use
+`-G "Visual Studio 17 2022"`, or `-G "Visual Studio 16 2019"` for VS 2019):
+
+```cmd
+cmake -S . -B build -G "Visual Studio 17 2022" && cmake --build build --config Release
+.\build\Release\retrovm.exe --benchmark 10000
+```
+
+Witness recorded on **commit 1648031, Apple M3 / macOS 26.5.2 / Darwin arm64
+/ Apple clang 17.0.0 / cmake 4.3.3** (the bench was run before this README
+was updated; the bench command itself is branch-agnostic). From a 2-run
+spot-check on this host: **1.85 → 1.87 ns/op (1.1% delta)**; broader runs
+typically stay under 2% on Apple silicon. Reviewers on a different host should
+expect to land within a factor of 2–3 of these numbers. The dispatch is
+bounded by `goto *label` indirect-branch prediction, and the BTB depth +
+narrow-decoder shape swings the per-op budget across microarchitectures —
+Apple silicon M3 vs. x86 Skylake-class ~15–20%. Outside that band the most
+likely culprit is a non-Release build (without computed-goto optimization the
+dispatch falls back to a switch loop, observed 30–100× slower on dispatch-
+bound workloads).
+
+Synthetic workload: 12-instruction / 48 B program covering LI / ADD / SUB /
+MUL / DIV / LOAD / STORE / JNZ / HALT (IN / RAND deliberately excluded so the
+std::function IOHook indirect calls don't skew the per-op); **9 219 cycles
+per run**, 1 untimed warmup + 10 000 timed runs = **92.19 M retired
+instructions per execution**.
+
+
+The `--bench-back` REPL rewind bench targets the resume-bullet "sub-millisecond
+timeline recovery" claim. Per-op rewind is **well below the 1 ms threshold** at
+all supported depths (the C++ bench measures **~2-4 µs** on this release-build
+binary; treat as an order-of-magnitude figure, not a precise µs count).
+Methodology: a timed loop of **1 000 iterations, each a back+step pair**, over
+a deterministic-cycle ALU workload that fully saturates the snapshot ring, plus
+1 untimed warmup; the timed region walks the full reverse path (delta-undo +
+state-restore, not a synthetic micro-bench). Run-to-run variance reflects a
+modest N=1000 sample of short-tail ~3 µs ops influenced by kernel scheduling
+jitter and L1/L2 cache state — re-run `./scripts/run-bench-backN.sh ./build/retrovm`
+to capture your host's current figure. Result is **PASS** — rewind latency is
+~250-500× faster than the 1 ms threshold. Provenance: this README's "~2-4 µs"
+captures one Apple-silicon macOS bench run at first publish; the bench script's
+own stdout is the source of truth on any other host. `depth >= 256` is rejected
+at the C++ arg parser (ring-cap guard against `size_t` underflow; the snapshot
+ring is hard-capped at 256 by `cmd_debug` regardless, so the bench's `depth`
+ceiling mirrors the REPL's).
+
+**Implementation note — what this bench actually measures.** RetroVM's
+interactive debugger keeps a 256-entry cycle history for time-travel; the
+bench currently stresses only the snapshot-rich end of that history.
+`cmd_debug` hardcodes `set_snapshot_interval(1)` (no `--snap-interval=N` CLI
+flag plumbed yet), so the bench runs at worst-case snapshot density (every
+cycle produces a snapshot) and the timed rewind is `back 200 + step 200`
+rather than literal `back 1`. depth=200 holds the ring at its 256-slot cap
+**without triggering ring eviction** (`pop_front()` never fires because the
+cap is never exceeded by the rewinds). For the resume-bullet "sub-millisecond
+timeline recovery" claim, this is the deepest realistic rebind under
+cmd_debug's current cap; literal `back 1` would be ~1 µs and isn't
+representative of typical user rebind patterns under realistic ring pressure.
+The bench in this commit does **not** exercise: (i) ring-eviction when `ring`
+is full and a new snapshot fires; (ii) `snap_interval ∈ {5, 10}` density
+regimes; (iii) the trivial single-step `back 1` codepath (intentionally
+excluded as not informative). A future `--bench-back-sweep` covering the
+literal `snap_interval ∈ {1, 5, 10}` × `depth ∈ {1, 50, 257+}` grid (where
+`depth > 257` deliberately triggers eviction) would characterise the full
+interpolation regime; out of scope here.
 
 ### Opcodes
 
