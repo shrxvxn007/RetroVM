@@ -62,10 +62,13 @@ typically stay under 2% on Apple silicon. Reviewers on a different host should
 expect to land within a factor of 2–3 of these numbers. The dispatch is
 bounded by `goto *label` indirect-branch prediction, and the BTB depth +
 narrow-decoder shape swings the per-op budget across microarchitectures —
-Apple silicon M3 vs. x86 Skylake-class ~15–20%. Outside that band the most
-likely culprit is a non-Release build (without computed-goto optimization the
-dispatch falls back to a switch loop, observed 30–100× slower on dispatch-
-bound workloads).
+Apple silicon M3 vs. x86 Skylake-class ~15–20%. Outside that band, the
+most likely culprit is a non-Release build: Debug-mode spot-record gave
+9.66 ns/op (496% of Release); `goto *label` still emits at `-O0`,
+so this bench avoids the switch-loop fallback that folklore expects.
+Folklore 30–100× figures apply to pure-dispatch loops with trivial
+handlers; this workload's handlers do real work, which caps the ratio
+at ~5×.
 
 Synthetic workload: 12-instruction / 48 B program covering LI / ADD / SUB /
 MUL / DIV / LOAD / STORE / JNZ / HALT (IN / RAND deliberately excluded so the
@@ -107,10 +110,19 @@ representative of typical user rebind patterns under realistic ring pressure.
 The bench in this commit does **not** exercise: (i) ring-eviction when `ring`
 is full and a new snapshot fires; (ii) `snap_interval ∈ {5, 10}` density
 regimes; (iii) the trivial single-step `back 1` codepath (intentionally
-excluded as not informative). A future `--bench-back-sweep` covering the
-literal `snap_interval ∈ {1, 5, 10}` × `depth ∈ {1, 50, 257+}` grid (where
-`depth > 257` deliberately triggers eviction) would characterise the full
-interpolation regime; out of scope here.
+excluded as not informative).All three regimes (`depth < cap`, `depth = cap`, `depth > cap`) are
+now exercised by `retrovm --bench-back-sweep [N]` — a peer of
+`--bench-back` — which sweeps the snap_interval × depth grid and prints
+a per-cell `µs / back op` table. Cells whose requested depth exceeds
+the ring cap clamp at ring-head (so the `size_t` underflow in
+`target_idx = history_index - depth` is impossible even at
+`depth = 1024`); the printed table annotates clamped cells with `>` so
+a reviewer can see at a glance which cells did not exercise the full
+rewind distance. The single-cell `--bench-back` bench remains the
+release-blocker sub-millisecond gate (with a PASS/FAIL exit code);
+`--bench-back-sweep` is a measurement tool that produces a 3×5 table
+and propagates a per-cell clean-run / FAIL exit code without a single
+PASS/FAIL verdict on the suite as a whole.
 
 ### Opcodes
 

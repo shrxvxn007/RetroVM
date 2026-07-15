@@ -130,6 +130,179 @@ void VM::make_snapshot() noexcept {
 //                              MAIN DISPATCH LOOP
 // =========================================================================
 HaltReason VM::run() {
+    // --------------------------------------------------------------------
+    //   Naive-switch dispatch path (baseline for --bench-dispatch-cmp)
+    // --------------------------------------------------------------------
+    //
+    //   MAINTENANCE: Adding a 13th opcode requires updating BOTH this
+    //   switch-case ladder AND the corresponding label_X handler body
+    //   further down in this same function. The two parallel
+    //   implementations MUST stay byte-equivalent or the comparison
+    //   ratio reported by --bench-dispatch-cmp becomes meaningless.
+    //   Inline grep anchors at every case-site: <SYNC:OP_X NaiveSwitch>
+    //   (here) pairs with the matching label_X handler (below) whose
+    //   identical work is visible by side-by-side diff.
+    //
+    //   Only entered when set_dispatch_mode(NaiveSwitch) flips this
+    //   field. Every other entry point (--bench, --bench-back,
+    //   --bench-back-sweep, REPL, record, replay, run, save, restore)
+    //   is unchanged — DispatchMode default is ComputedGoto so this
+    //   whole block is dead code at runtime for non-benchmark-cmp
+    //   invocations. The `if` below is a single predicted branch that
+    //   adds ~0 cycles per call to both modes once the predictor
+    //   settles (which happens after the first iter of the bench).
+    if (dispatch_mode_ == DispatchMode::NaiveSwitch) {
+        while (state_.halted == HALT_RUNNING) {
+            // Fetch + decode + snap plumbing — mirrors TAIL_DISPATCH()
+            // from the computed-goto path below so both paths issue
+            // identical mem_load_u32 / halt-check / snap-timer-reload
+            // work per cycle.
+            const std::uint32_t instr =
+                mem_load_u32(mem_.get(), state_.pc);
+            state_.pc += 4u;
+            ++state_.cycle_count;
+            if (__builtin_expect(state_.snap_interval > 0, 0)) {
+                if (__builtin_expect(--state_.snap_timer == 0, 0)) {
+                    make_snapshot();
+                    state_.snap_timer = state_.snap_interval;
+                    if (__builtin_expect(state_.halted != HALT_RUNNING, 0)) {
+                        return state_.halted;
+                    }
+                }
+            }
+            const std::uint32_t op  = decode_op(instr);
+            const std::uint32_t dst = decode_dst(instr);
+            const std::uint32_t src = decode_src(instr);
+            const std::uint32_t imm = decode_imm(instr);
+            if (__builtin_expect(op >= OP_COUNT, 0)) {
+                state_.halted = HALT_UNKNOWN_OP;
+                return state_.halted;
+            }
+            // Dispatch via cascade switch. Per-op handler bodies are
+            // byte-equivalent to the corresponding `case OP_X:` block
+            // in the computed-goto path's labels below.
+            switch (op) {
+                case OP_HALT:                                            // <SYNC:OP_HALT NaiveSwitch>
+                    state_.halted = HALT_NORMAL;
+                    return HALT_NORMAL;
+                case OP_LOAD:                                            // <SYNC:OP_LOAD NaiveSwitch>
+                    state_.regs[dst] = mem_load_u32(mem_.get(), imm);
+                    break;
+                case OP_STORE: {                                         // <SYNC:OP_STORE NaiveSwitch>
+                    const std::uint8_t  page   = static_cast<std::uint8_t>((imm >> 12) & 0xFFu);
+                    const std::uint16_t offset = static_cast<std::uint16_t>(imm & 0xFFFu);
+                    if (!deltas_.empty()
+                        && deltas_.back().page   == page
+                        && deltas_.back().offset == offset
+                        && deltas_.back().run_count < 255u) {
+                        ++deltas_.back().run_count;
+                    } else {
+                        MemDelta d;
+                        d.run_count = 1u;
+                        d.page      = page;
+                        d.offset    = offset;
+                        d.old_value = mem_load_u32(mem_.get(), imm);
+                        deltas_.push_back(d);
+                    }
+                    mem_store_u32(mem_.get(), imm, state_.regs[dst]);
+                    break;
+                }
+                case OP_ADD: {                                          // <SYNC:OP_ADD NaiveSwitch>
+                    const uint32_t a = state_.regs[dst];
+                    const uint32_t b = state_.regs[src];
+                    const uint32_t r = a + b;
+                    state_.regs[dst] = r;
+                    uint32_t f = 0;
+                    if (r == 0u)         f |= FLAG_ZF;
+                    if (r < a)           f |= FLAG_CF;
+                    if (r & 0x80000000u) f |= FLAG_SF;
+                    state_.flags = f;
+                    break;
+                }
+                case OP_SUB: {                                          // <SYNC:OP_SUB NaiveSwitch>
+                    const uint32_t a = state_.regs[dst];
+                    const uint32_t b = state_.regs[src];
+                    const uint32_t r = a - b;
+                    state_.regs[dst] = r;
+                    uint32_t f = 0;
+                    if (r == 0u)         f |= FLAG_ZF;
+                    if (a < b)           f |= FLAG_CF;
+                    if (r & 0x80000000u) f |= FLAG_SF;
+                    state_.flags = f;
+                    break;
+                }
+                case OP_MUL: {                                          // <SYNC:OP_MUL NaiveSwitch>
+                    const uint32_t a = state_.regs[dst];
+                    const uint32_t b = state_.regs[src];
+                    const uint64_t p = static_cast<uint64_t>(a) * static_cast<uint64_t>(b);
+                    const uint32_t r = static_cast<uint32_t>(p);
+                    state_.regs[dst] = r;
+                    uint32_t f = 0;
+                    if (r == 0u)                  f |= FLAG_ZF;
+                    if (p > 0xFFFFFFFFull)        f |= FLAG_CF;
+                    if (r & 0x80000000u)          f |= FLAG_SF;
+                    state_.flags = f;
+                    break;
+                }
+                case OP_DIV: {                                          // <SYNC:OP_DIV NaiveSwitch>
+                    const uint32_t a = state_.regs[dst];
+                    const uint32_t b = state_.regs[src];
+                    if (__builtin_expect(b == 0u, 0)) {
+                        state_.pc -= 4u;
+                        state_.halted = HALT_DIV_ZERO;
+                        return HALT_DIV_ZERO;
+                    }
+                    const uint32_t q = a / b;
+                    state_.regs[dst] = q;
+                    uint32_t f = 0;
+                    if (q == 0u)         f |= FLAG_ZF;
+                    if (q & 0x80000000u) f |= FLAG_SF;
+                    state_.flags = f;
+                    break;
+                }
+                case OP_JUMP:                                           // <SYNC:OP_JUMP NaiveSwitch>
+                    // JUMP [imm20] -- unconditional, absolute 4-byte aligned target.
+                    state_.pc = imm;
+                    break;
+                case OP_JNZ:                                            // <SYNC:OP_JNZ NaiveSwitch>
+                    // JNZ Rd, [imm20] -- jump iff Rd != 0.
+                    if (state_.regs[dst] != 0u) state_.pc = imm;
+                    break;
+                case OP_IN: {                                           // <SYNC:OP_IN NaiveSwitch>
+                    // IN Rd -- pull a 32-bit int from "the world". Default: stdin.
+                    // Same cycle-aware on_nondeterministic hook as label_IN.
+                    if (io_.in) {
+                        const uint32_t v = io_.in(state_.cycle_count);
+                        state_.regs[dst] = v;
+                        if (io_.on_nondeterministic)
+                            io_.on_nondeterministic(state_.cycle_count, OP_IN, v);
+                    }
+                    break;
+                }
+                case OP_RAND: {                                         // <SYNC:OP_RAND NaiveSwitch>
+                    // RAND Rd -- fill Rd from the PRNG. Same hook as label_RAND.
+                    if (io_.rand) {
+                        const uint32_t v = io_.rand(state_.cycle_count);
+                        state_.regs[dst] = v;
+                        if (io_.on_nondeterministic)
+                            io_.on_nondeterministic(state_.cycle_count, OP_RAND, v);
+                    }
+                    break;
+                }
+                case OP_LI:                                             // <SYNC:OP_LI NaiveSwitch>
+                    // LI Rd, imm20 -- load-immediate: Rd = imm20. Zero memory traffic.
+                    state_.regs[dst] = imm;
+                    break;
+                default:
+                    // The op >= OP_COUNT guard above already trapped
+                    // out-of-range opcodes; this default keeps -Wswitch
+                    // quiet without re-emitting HALT_UNKNOWN_OP.
+                    break;
+            }
+        }
+        return state_.halted;   // reachable via while-loop exit
+    }
+
     // The dispatch table is built from `&&label` (computed goto) addresses
     // of labels declared inside this same function. `static` makes the
     // initialization happen exactly once across calls; the compiler typically

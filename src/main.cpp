@@ -546,6 +546,211 @@ int cmd_benchmark(std::size_t n_iters) {
 
 static constexpr std::size_t kBenchRingCap = 256u;  // matches CmdDebug::kRingCap
 
+int cmd_benchmark_dispatch_cmp(std::size_t n_iters) {
+    // Same 12-instruction synthetic workload as cmd_benchmark. Runs the
+    // workload through BOTH dispatch modes (ComputedGoto + NaiveSwitch)
+    // back-to-back and prints ns/op + speedup factor.
+    const std::vector<uint32_t> program = {
+        encode(OP_LI,    0, 0, 1024u),
+        encode(OP_LI,    1, 0, 1u  ),
+        encode(OP_ADD,   2, 1, 0u  ),
+        encode(OP_ADD,   3, 1, 0u  ),
+        encode(OP_SUB,   4, 0, 0u  ),
+        encode(OP_MUL,   5, 1, 0u  ),
+        encode(OP_DIV,   6, 1, 0u  ),
+        encode(OP_STORE, 2, 0, 0x100u),
+        encode(OP_LOAD,  7, 0, 0x100u),
+        encode(OP_SUB,   0, 1, 0u  ),
+        encode(OP_JNZ,   0, 0, 0x08u),
+        encode(OP_HALT,  0, 0, 0u  ),
+    };
+
+    auto run_mode = [&](retrovm::DispatchMode mode) -> double {
+        VM vm;
+        vm.set_dispatch_mode(mode);
+        if (!vm.load_program(reinterpret_cast<const uint8_t*>(program.data()),
+                             program.size() * 4u)) {
+            return -1.0;
+        }
+        const HaltReason sanity = vm.run();
+        if (sanity != HALT_NORMAL) return -1.0;
+        if (vm.state().cycle_count != (2u + 9u * 1024u + 1u)) return -1.0;
+        vm.reset_cpu_for_reuse();
+        vm.run();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < n_iters; ++i) {
+            vm.reset_cpu_for_reuse();
+            vm.run();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        const double total_ns =
+            std::chrono::duration<double, std::nano>(t1 - t0).count();
+        return total_ns / static_cast<double>(vm.state().cycle_count * n_iters);
+    };
+
+    const double ns_goto   = run_mode(retrovm::DispatchMode::ComputedGoto);
+    const double ns_switch = run_mode(retrovm::DispatchMode::NaiveSwitch);
+    if (ns_goto < 0.0 || ns_switch < 0.0) {
+        std::fprintf(stderr,
+            "retrovm --bench-dispatch-cmp: sanity check failed (refusing "
+            "to print a divergent benchmark)\n");
+        return 1;
+    }
+    std::printf("computed-goto : %.2f ns/op\n", ns_goto);
+    std::printf("naive-switch  : %.2f ns/op\n", ns_switch);
+    if (ns_goto > 0.0) {
+        std::printf("speedup       : %.2fx (goto -vs- switch)\n",
+                    ns_switch / ns_goto);
+    }
+    return 0;
+}
+
+static constexpr std::size_t kSweepItersDefault = 200u;
+
+int cmd_benchmark_back_sweep(std::size_t n_iters) {
+    // 3x5 grid: 3 snap_intervals x 5 depths. The depth axis tests both
+    // ring-resident (`depth <= 256`) and ring-eviction (`depth > 256`)
+    // paths; the snap_interval axis tests ring-push frequency and
+    // therefore the snapshot-sink CPU cost.
+    const std::size_t snap_intervals[3] = { 1u, 10u, 100u };
+    const std::size_t depths[5]         = { 1u, 50u, 257u, 512u, 1024u };
+
+    const std::vector<uint32_t> program = {
+        encode(OP_LI,    0, 0, 1024u),
+        encode(OP_LI,    1, 0, 1u  ),
+        encode(OP_ADD,   2, 1, 0u  ),
+        encode(OP_ADD,   3, 1, 0u  ),
+        encode(OP_SUB,   4, 0, 0u  ),
+        encode(OP_MUL,   5, 1, 0u  ),
+        encode(OP_DIV,   6, 1, 0u  ),
+        encode(OP_STORE, 2, 0, 0x100u),
+        encode(OP_LOAD,  7, 0, 0x100u),
+        encode(OP_SUB,   0, 1, 0u  ),
+        encode(OP_JNZ,   0, 0, 0x08u),
+        encode(OP_HALT,  0, 0, 0u  ),
+    };
+
+    std::printf("retrovm: benchmark back-N sweep\n");
+    std::printf("  synthetic workload   : %zu instructions, %llu cycles/run\n",
+                program.size(),
+                static_cast<unsigned long long>(2u + 9u * 1024u + 1u));
+    std::printf("  timed iters / cell   : %zu\n", n_iters);
+    std::printf("  snap_intervals (rows): {1, 10, 100}\n");
+    std::printf("  depths (cols)        : {1, 50, 257, 512, 1024}\n\n");
+
+    std::printf("  us / back op (lower = faster):\n");
+    std::printf("    snap_int \\ depth |");
+    for (const auto d : depths) {
+        std::printf("%10zu", d);
+    }
+    std::printf("\n    -----------------+");
+    for (std::size_t i = 0; i < 5; ++i) {
+        std::printf("----------");
+    }
+    std::printf("\n");
+
+    for (const auto si : snap_intervals) {
+        std::printf("    %13zu |", si);
+        for (const auto depth : depths) {
+            VM vm;
+            if (!vm.load_program(reinterpret_cast<const uint8_t*>(program.data()),
+                                  program.size() * 4u)) {
+                std::printf("    ERR!");
+                continue;
+            }
+
+            std::deque<Snapshot> ring;
+            std::size_t          history_index = 0;
+            std::uint64_t        target_cycle  = UINT64_MAX;
+
+            vm.set_snapshot_interval(si);
+            vm.set_snapshot_sink(
+                [&ring, &history_index, &target_cycle, &vm]
+                (const Snapshot& s) {
+                    if (target_cycle != UINT64_MAX
+                        && s.cycle_count >= target_cycle) {
+                        target_cycle = UINT64_MAX;
+                        vm.request_halt(HALT_STEP);
+                    }
+                    ring.resize(history_index + 1);
+                    ring.push_back(s);
+                    if (ring.size() > kBenchRingCap) {
+                        ring.pop_front();
+                        // history_index unchanged: still points at ring.back().
+                    } else {
+                        ++history_index;
+                    }
+                });
+
+            const HaltReason sanity = vm.run();
+            if (sanity != HALT_NORMAL) {
+                std::printf("    ERR!");
+                continue;
+            }
+            if (vm.state().cycle_count != (2u + 9u * 1024u + 1u)) {
+                std::printf("    ERR!");
+                continue;
+            }
+
+            auto undo_deltas = [&](std::size_t lo, std::size_t hi) {
+                for (std::size_t k = hi; k > lo; --k) {
+                    const auto& deltas = ring[k].deltas;
+                    for (auto it = deltas.rbegin(); it != deltas.rend(); ++it) {
+                        vm.apply_old_value(*it);
+                    }
+                }
+            };
+            auto restore_state = [&](std::size_t idx) {
+                const Snapshot& tgt = ring[idx];
+                VMState vs = vm.state();
+                vs.cycle_count = tgt.cycle_count;
+                for (int i = 0; i < 8; ++i) vs.regs[i] = tgt.regs[i];
+                vs.pc     = tgt.pc;
+                vs.sp     = tgt.sp;
+                vs.flags  = tgt.flags;
+                vs.halted = tgt.halted;
+                vm.set_state(vs);
+            };
+            // do_back: clamp depth to ring-resident range. On `depth >
+            // 256` cells the underflow `(history_index - depth) : size_t`
+            // would wrap; clamp to 0 so we still produce a measurable
+            // (large) number on the eviction-stress cells.
+            auto do_back = [&]() {
+                const std::size_t tgt =
+                    (depth > history_index) ? 0u : (history_index - depth);
+                undo_deltas(tgt, history_index);
+                restore_state(tgt);
+                history_index = tgt;
+            };
+            auto do_step = [&]() {
+                VMState vs = vm.state();
+                vs.halted = HALT_RUNNING;
+                vm.set_state(vs);
+                target_cycle = vm.state().cycle_count + depth;
+                vm.run();
+            };
+
+            do_back();
+            do_step();
+
+            const auto t0 = std::chrono::steady_clock::now();
+            for (std::size_t i = 0; i < n_iters; ++i) {
+                do_back();
+                do_step();
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double total_us =
+                std::chrono::duration<double, std::micro>(t1 - t0).count();
+            const double us_per_back_op =
+                total_us / static_cast<double>(n_iters);
+            std::printf("%10.3f", us_per_back_op);
+        }
+        std::printf("\n");
+    }
+    return 0;
+}
+
+
 int cmd_benchmark_backn(std::size_t n_iters, std::size_t depth) {
     // Belt-and-braces guard against depth == kBenchRingCap, which would
     // make do_back() compute (kBenchRingCap - 1) - kBenchRingCap as a
@@ -2172,6 +2377,47 @@ int main(int argc, char** argv) {
             depth = static_cast<std::size_t>(parsed);
         }
         return cmd_benchmark_backn(n, depth);
+    }
+    if (mode == "--bench-dispatch-cmp" || mode == "bench-dispatch-cmp") {
+        // retrovm --bench-dispatch-cmp [N]
+        //   N = timed iters per mode (default 1000; max 100000000)
+        // Runs the same 9219-cycle synthetic workload through BOTH
+        // dispatch modes (ComputedGoto + NaiveSwitch) back-to-back and
+        // prints ns/op + speedup factor.
+        std::size_t n = 1000;
+        if (argc >= 3) {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(argv[2], &end, 10);
+            if (end == argv[2] || *end || parsed == 0u || parsed > 100000000u) {
+                std::fprintf(stderr,
+                    "retrovm --bench-dispatch-cmp: invalid N '%s' "
+                    "(expected 1..100000000)\n",
+                    argv[2]);
+                return 1;
+            }
+            n = static_cast<std::size_t>(parsed);
+        }
+        return cmd_benchmark_dispatch_cmp(n);
+    }
+    if (mode == "--bench-back-sweep" || mode == "bench-back-sweep") {
+        // retrovm --bench-back-sweep [N]
+        //   N = timed iters per cell (default 200; max 100000000)
+        // Sweeps the 3x5 snap_interval x depth grid and prints a
+        // per-cell `us / back op` table.
+        std::size_t n = kSweepItersDefault;
+        if (argc >= 3) {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(argv[2], &end, 10);
+            if (end == argv[2] || *end || parsed == 0u || parsed > 100000000u) {
+                std::fprintf(stderr,
+                    "retrovm --bench-back-sweep: invalid N '%s' "
+                    "(expected 1..100000000)\n",
+                    argv[2]);
+                return 1;
+            }
+            n = static_cast<std::size_t>(parsed);
+        }
+        return cmd_benchmark_back_sweep(n);
     }
     if (mode == "snapshot" || mode == "snap") {
         if (argc < 3) {

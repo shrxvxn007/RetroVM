@@ -60,6 +60,18 @@ add_test(NAME retrovm_builtin_demo
 set_tests_properties(retrovm_builtin_demo PROPERTIES
          ENVIRONMENT "LC_ALL=C")
 
+# --bench-dispatch-cmp regression test. Runs the same 9219-cycle
+# synthetic workload through BOTH dispatch modes (computed-goto +
+# naive-switch) back-to-back and prints ns/op + speedup factor.
+# Wall-clock ~70 ms at N=1000 (9219 cycles per run × 2000 timed
+# iters × 2 modes). Exit 0 on a clean ratio output; non-zero on
+# sanity-check failure. Added per the post-implementation review.
+add_test(NAME retrovm_bench_dispatch_cmp
+         COMMAND retrovm --bench-dispatch-cmp 1000)
+set_tests_properties(retrovm_bench_dispatch_cmp PROPERTIES
+         ENVIRONMENT "LC_ALL=C"
+         TIMEOUT 60)
+
 # Phase 3 record+replay round-trip tests. Each test invokes the shared
 # tests/record_replay.sh helper, which asserts (a) record exits 0,
 # (b) replay exits 0, (c) the cycle count printed by dump_state matches

@@ -116,6 +116,35 @@ struct SnapshotFileRegs {
 };
 static_assert(sizeof(SnapshotFileRegs) == 40, "SnapshotFileRegs must be 40 B");
 
+// =========================================================================
+//   DispatchMode — VM::run() control-flow selector (retrovm namespace)
+// =========================================================================
+//
+//   Lives at retrovm namespace scope (NOT nested inside class VM) so
+//   external callers — e.g. main.cpp's cmd_benchmark_dispatch_cmp —
+//   can write `using retrovm::DispatchMode;` without qualifying through
+//   VM::. Nested types in class VM do not promote to the enclosing
+//   namespace in C++, so the setter's full type (`VM::DispatchMode`)
+//   would have leaked into main.cpp. Putting the enum at namespace
+//   scope keeps the call sites clean and makes the type reusable by
+//   any future bench that wants to flip dispatch control flow without
+//   becoming a member of VM.
+//
+//   Two members:
+//     ComputedGoto : default production dispatch (`&&label` indirect
+//                    jumps; ~1.87 ns/op on Apple Clang).
+//     NaiveSwitch  : cascade ladder (`while + switch(op)`); the apples-
+//                    to-apples baseline for --bench-dispatch-cmp.
+//
+//   Maintenance: adding a new opcode requires updating BOTH dispatch
+//   paths in vm.cpp's VM::run() (the &&label labels AND the
+//   corresponding case in the switch-case ladder). See the
+//   MAINTENANCE block at the top of VM::run() in vm.cpp.
+enum class DispatchMode : std::uint8_t {
+    ComputedGoto = 0,  // default: &&label + goto *dispatch[op]
+    NaiveSwitch  = 1,  // while + switch(op) cascade ladder
+};
+
 class VM {
 public:
     static constexpr std::size_t MEM_SIZE = 1024u * 1024u;     // 1 MiB
@@ -226,6 +255,17 @@ public:
     // Number of memory-delta entries accumulated since the last snapshot.
     std::size_t pending_deltas() const noexcept { return deltas_.size(); }
 
+    // Dispatch control-flow setter / getter. The enum itself
+    // (DispatchMode) lives at retrovm namespace scope below so
+    // external callers — including main.cpp's cmd_benchmark_dispatch_cmp —
+    // can write `using retrovm::DispatchMode;` without needing to
+    // qualify through VM::. The enum's contract (ComputedGoto vs
+    // NaiveSwitch) and the maintenance rule (new opcode requires
+    // updating BOTH dispatch paths in vm.cpp) are documented adjacent
+    // to the enum's declaration.
+    void set_dispatch_mode(DispatchMode m) noexcept { dispatch_mode_ = m; }
+    DispatchMode dispatch_mode() const noexcept { return dispatch_mode_; }
+
 private:
     // Internal: build a Snapshot, drain the delta log, dispatch to sink.
     // Called from TAIL_DISPATCH when snap_timer counts down to zero.
@@ -238,6 +278,12 @@ private:
     IOHooks      io_{};
     SnapshotSink snap_sink_;
     std::vector<MemDelta> deltas_;
+    // Dispatch hairpin selector; see the public DispatchMode getter
+    // above. Default ComputedGoto preserves the historical dispatch
+    // behaviour for every existing --bench-* benchmark and the REPL.
+    DispatchMode dispatch_mode_ = DispatchMode::ComputedGoto;
 };
 
 } // namespace retrovm
+
+
