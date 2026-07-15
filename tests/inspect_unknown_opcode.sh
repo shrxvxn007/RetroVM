@@ -24,21 +24,12 @@
 #     _pad0[3]    = 0, 0, 0
 #     value[4]    = 0 (LE)
 #
-# NOTE on the mint step: bash 3.2's printf builtin emits a trailing
-# C-string NUL after EACH invocation (verified live via `bash -c
-# 'printf "RVMTRACE" | wc -c'` returning 9 on bash 3.2.57 — 8 ASCII
-# letters + 1 trailing NUL).  A multi-call block emits extra NULs
-# interleaved between content bytes that scramble the wire format,
-# so this test uses a SINGLE printf call for the full 32-byte content;
-# the trailing NUL is then stripped by `head -c 32` so the file is
-# exactly 32 B with the byte layout below:
-#       bytes 0..7 : "RVMTRACE"     (magic[8])
-#       bytes 8..11: 0x01 LE        (version=1)
-#       bytes 12..15: 0x00 × 4      (reserved=0)
-#       bytes 16..23: 0x00 × 8      (cycle=0)
-#       byte 24    : 0x42           (opcode=0x42, the unknown path)
-#       bytes 25..27: 0x00 × 3      (_pad0)
-#       bytes 28..31: 0x00 × 4      (value=0)
+# Mint + per-byte hex assertion + locale-stability guard delegate to
+# `tests/_lib.sh: mint_synth_trace`. This file only declares the
+# EXPECTED_BYTES array (the wire-format spec) and the call. See
+# `_lib.sh`'s docstring for the bash 3.2 trailing-NUL trap, the
+# `<NL>+# comment` `$(...)` parser pitfall, and the rationale for
+# the anti-drift EXPECTED_HEX derivation from the same byte list.
 #
 # Args:
 #   $1 = path to retrovm binary
@@ -54,29 +45,23 @@ RETROVM="$1"
 TMP_TRACE=$(mktemp -t retrovm_unknown_opcode.XXXXX.trace)
 trap 'rm -f "$TMP_TRACE"' EXIT
 
-# 1. Mint the 32 B synthetic .trace.  Format breakdown (verified by
-#    hand against include/retrovm/trace.hpp:53-58):
-#      RVMTRACE\x01          (8 + 1 = 9 B; magic + version LSB)
-#      ×15 \x00              (15 B; version high + reserved + cycle)
-#      \x42                  (1 B; opcode, the unknown-opcode path)
-#      ×7 \x00               (7 B; _pad0 + value)
-#    Total escapes = 24 + 8 ASCII = 32 B content; + 1 trailing NUL =
-#    33 B from printf; `head -c 32` strips the trailing NUL so the
-#    file is exactly 32 B.
-# Format breakdown matches the wire-format reference in the file-level
-# docstring above (8 ASCII + 24 escapes = 32 B content; +1 trailing
-# NUL from bash 3.2 printf; `head -c 32` strips it).
-printf 'RVMTRACE\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x42\x00\x00\x00\x00\x00\x00\x00' \
-    | head -c 32 > "$TMP_TRACE"
-
-# Sanity-check the geometry (16 B header + 16 B frame) before any
-# per-row assertion; a truncated file would let an unrelated code
-# path run silently without tripping the checks below.
-ACTUAL=$(wc -c < "$TMP_TRACE" | tr -d ' ')
-if [ "$ACTUAL" != "32" ]; then
-    echo "FAIL: synthetic trace is $ACTUAL bytes, want 32" >&2
-    exit 1
-fi
+EXPECTED_BYTES=(
+    # bytes 0-7 : magic
+    0x52 0x56 0x4d 0x54 0x52 0x41 0x43 0x45
+    # bytes 8-11 : version
+    0x01 0x00 0x00 0x00
+    # bytes 12-15 : reserved
+    0x00 0x00 0x00 0x00
+    # bytes 16-23 : cycle
+    0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+    # byte 24 : opcode=0x42
+    0x42
+    # bytes 25-27 : _pad0
+    0x00 0x00 0x00
+    # bytes 28-31 : value
+    0x00 0x00 0x00 0x00
+)
+mint_synth_trace "${#EXPECTED_BYTES[@]}" "$TMP_TRACE" "${EXPECTED_BYTES[@]}"
 
 OUT=$("$RETROVM" trace "$TMP_TRACE" --frame=0 2>&1)
 echo "$OUT"
@@ -104,5 +89,5 @@ if [ "$FRAME_IDX" != "0" ] || [ "$CYCLE" != "0" ] || [ "$VALUE" != "0" ]; then
     exit 1
 fi
 
-echo "OK: synthetic-fixture unknown-opcode branch verified ($ACTUAL-byte trace, opcode=0x42 -> 'unknown')"
+echo "OK: synthetic-fixture unknown-opcode branch verified (32-byte trace, opcode=0x42 -> 'unknown')"
 exit 0
