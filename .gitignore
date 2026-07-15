@@ -27,3 +27,19 @@ compile_commands.json
 # Throwaway artefacts
 *.trace
 *.bin.tmp
+
+# Cleanup of one-shot scaffolding
+# (see commit titled "chore(scripts): remove one-shot migration scaffolding").
+#
+# The six scripts/ entries below were migration glue for two broken-revert
+# incidents earlier in this project (Phase 8 hint revert + the duplicate-
+# brace recovery). They were never tracked by git, so a plain `git commit`
+# against them produces no diff -- git only records changes to tracked
+# files. Recording them in .gitignore is the actually-enforced mechanism
+# that prevents their filenames from quietly re-entering the working tree.
+scripts/finish_reapply.py
+scripts/patch_main_apply.py
+scripts/reapply_dispatch_and_sweep.py
+scripts/revert_hint_experiment.py
+scripts/run-bench-backSweep.sh
+scripts/run-bench-dispatch.sh
